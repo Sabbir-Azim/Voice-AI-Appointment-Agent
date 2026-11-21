@@ -69,11 +69,11 @@ async def test_pattern_3_preload_prompts_for_name_when_missing(
     )
 
 
-async def test_pattern_4_lookup_order(seeded_db: AsyncDatabase) -> None:
-    order = await seeded_db.orders.find_one({"order_id": "order_1001"})
-    assert order is not None
-    assert order["items"] == ["Widget A", "Widget B"]
-    assert order["status"] == "delivered"
+async def test_pattern_4_doctors_seeded(seeded_db: AsyncDatabase) -> None:
+    doctor = await seeded_db.doctors.find_one({"doctor_id": "dr_khan"})
+    assert doctor is not None
+    assert doctor["specialty"] == "General Practice"
+    # Full booking coverage lives in tests/test_appointments.py.
 
 
 async def test_pattern_1_vector_search_returns_results(

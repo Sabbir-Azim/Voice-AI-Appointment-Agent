@@ -1,4 +1,4 @@
-// Seed MongoDB with sample users, orders, and knowledge documents.
+// Seed MongoDB with sample users, doctors, and clinic knowledge documents.
 //
 // Run after db/indexes.ts:
 //
@@ -8,7 +8,7 @@
 
 import { MongoClient } from 'mongodb';
 import { loadEnv, requireEnv } from './lib/env';
-import { KNOWLEDGE_INPUTS, ORDERS, USERS } from './lib/data';
+import { DOCTORS, KNOWLEDGE_INPUTS, USERS } from './lib/data';
 import { embedTexts } from './lib/voyage';
 
 const DEFAULT_DB_NAME = 'livekit_mongo_starter';
@@ -20,9 +20,16 @@ async function seedData(): Promise<void> {
   const client = new MongoClient(requireEnv('MONGODB_URI'));
   await client.connect();
   try {
-    const db = client.db(process.env.MONGODB_DB ?? DEFAULT_DB_NAME);
+    const db = client.db(process.env.MONGODB_DB || DEFAULT_DB_NAME);
 
-    for (const name of ['users', 'orders', 'knowledge', 'memories', 'sessions']) {
+    for (const name of [
+      'users',
+      'doctors',
+      'appointments',
+      'knowledge',
+      'memories',
+      'sessions',
+    ]) {
       await db.collection(name).deleteMany({});
     }
     console.info('Cleared existing data from all collections');
@@ -33,9 +40,9 @@ async function seedData(): Promise<void> {
     await db.collection('users').insertMany(users);
     console.info(`Inserted ${users.length} users`);
 
-    const orders = ORDERS.map((o) => ({ ...o, created_at: now }));
-    await db.collection('orders').insertMany(orders);
-    console.info(`Inserted ${orders.length} orders`);
+    const doctors = DOCTORS.map((d) => ({ ...d, created_at: now }));
+    await db.collection('doctors').insertMany(doctors);
+    console.info(`Inserted ${doctors.length} doctors (appointments start empty)`);
 
     const embeddings = await embedTexts(
       KNOWLEDGE_INPUTS.map((doc) => doc.content),

@@ -34,7 +34,7 @@ export async function getMongoClient(): Promise<MongoClient> {
 
 export async function getDb(name?: string): Promise<Db> {
   const c = await getMongoClient();
-  return c.db(name ?? process.env.MONGODB_DB ?? DEFAULT_DB_NAME);
+  return c.db(name || process.env.MONGODB_DB || DEFAULT_DB_NAME);
 }
 
 export async function closeMongoClient(): Promise<void> {

@@ -14,6 +14,7 @@ dependencies = [
     "python-dotenv",
     "pymongo>=4.13",
     "voyageai>=0.3.7",
+    "tzdata>=2026.6",
 ]
 
 [dependency-groups]

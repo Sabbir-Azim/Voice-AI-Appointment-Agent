@@ -1,7 +1,7 @@
 """Shared pytest fixtures.
 
 The seeded_db fixture provisions a fresh database per test (named with a
-millisecond timestamp), seeds it with users/orders/knowledge documents,
+millisecond timestamp), seeds it with users/doctors/knowledge documents,
 and tears it down at the end. Tests that need MongoDB are skipped when
 MONGODB_URI is not set.
 
@@ -80,7 +80,14 @@ async def test_db() -> AsyncGenerator[AsyncDatabase, None]:
 @pytest.fixture
 async def seeded_db(test_db: AsyncDatabase) -> AsyncGenerator[AsyncDatabase, None]:
     await test_db.users.create_index("user_id", unique=True)
-    await test_db.orders.create_index("order_id", unique=True)
+    await test_db.doctors.create_index("doctor_id", unique=True)
+    # Mirrors appointments_slot_unique in db/indexes.ts.
+    await test_db.appointments.create_index(
+        [("doctor_id", 1), ("start", 1)],
+        unique=True,
+        name="appointments_slot_unique",
+        partialFilterExpression={"status": "booked"},
+    )
 
     await test_db.users.insert_one(
         {
@@ -91,15 +98,29 @@ async def seeded_db(test_db: AsyncDatabase) -> AsyncGenerator[AsyncDatabase, Non
             "created_at": _now(),
         }
     )
-    await test_db.orders.insert_one(
-        {
-            "user_id": "user_1",
-            "order_id": "order_1001",
-            "items": ["Widget A", "Widget B"],
-            "total": 49.99,
-            "status": "delivered",
-            "created_at": _now(),
-        }
+    await test_db.doctors.insert_many(
+        [
+            {
+                "doctor_id": "dr_khan",
+                "name": "Dr. Amina Khan",
+                "specialty": "General Practice",
+                "working_days": [1, 2, 3, 4, 5],
+                "start_hour": 9,
+                "end_hour": 17,
+                "slot_minutes": 30,
+                "created_at": _now(),
+            },
+            {
+                "doctor_id": "dr_patel",
+                "name": "Dr. Priya Patel",
+                "specialty": "Dermatology",
+                "working_days": [2, 4, 6],
+                "start_hour": 9,
+                "end_hour": 13,
+                "slot_minutes": 20,
+                "created_at": _now(),
+            },
+        ]
     )
 
     knowledge_inputs = [

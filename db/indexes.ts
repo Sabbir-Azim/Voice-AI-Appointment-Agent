@@ -78,12 +78,19 @@ async function createIndexes(): Promise<void> {
   const client = new MongoClient(requireEnv('MONGODB_URI'));
   await client.connect();
   try {
-    const db = client.db(process.env.MONGODB_DB ?? DEFAULT_DB_NAME);
+    const db = client.db(process.env.MONGODB_DB || DEFAULT_DB_NAME);
 
     const existing = new Set(
       (await db.listCollections({}, { nameOnly: true }).toArray()).map((c) => c.name),
     );
-    for (const name of ['users', 'orders', 'sessions', 'knowledge', 'memories']) {
+    for (const name of [
+      'users',
+      'doctors',
+      'appointments',
+      'sessions',
+      'knowledge',
+      'memories',
+    ]) {
       if (!existing.has(name)) {
         await db.createCollection(name);
         console.info(`${name}: collection created`);
@@ -93,9 +100,24 @@ async function createIndexes(): Promise<void> {
     await db.collection('users').createIndex({ user_id: 1 }, { unique: true });
     console.info('users: user_id unique index ready');
 
-    await db.collection('orders').createIndex({ order_id: 1 }, { unique: true });
-    await db.collection('orders').createIndex({ user_id: 1 });
-    console.info('orders: order_id unique + user_id indexes ready');
+    await db.collection('doctors').createIndex({ doctor_id: 1 }, { unique: true });
+    console.info('doctors: doctor_id unique index ready');
+
+    // One *booked* appointment per doctor per start time. The partial filter
+    // lets a cancelled slot be booked again while still blocking double
+    // bookings, even when two callers race for the same slot.
+    await db
+      .collection('appointments')
+      .createIndex(
+        { doctor_id: 1, start: 1 },
+        {
+          unique: true,
+          name: 'appointments_slot_unique',
+          partialFilterExpression: { status: 'booked' },
+        },
+      );
+    await db.collection('appointments').createIndex({ user_id: 1, start: 1 });
+    console.info('appointments: (doctor_id, start) unique + (user_id, start) indexes ready');
 
     await db.collection('sessions').createIndex({ session_id: 1 }, { unique: true });
     await db.collection('sessions').createIndex({ user_id: 1 });

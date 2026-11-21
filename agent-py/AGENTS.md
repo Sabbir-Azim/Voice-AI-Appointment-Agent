@@ -19,7 +19,7 @@ This agent integrates MongoDB Atlas across five hooks:
 | Pattern | Hook | File |
 | --- | --- | --- |
 | Pre-load user context | `entrypoint` -> `preload_user` | `src/agent.py` |
-| Function-tool CRUD | `@function_tool lookup_order` | `src/agent.py` |
+| Function-tool CRUD | `@function_tool list_doctors/check_availability/book_appointment/my_appointments/cancel_appointment` | `src/agent.py` + `src/tools/appointments.py` |
 | RAG via `$vectorSearch` | `on_user_turn_completed` | `src/agent.py` |
 | Session report persistence | `on_session_end` | `src/agent.py` |
 | Agentic memory tools | `@function_tool remember/recall/forget/search_memories` | `src/agent.py` + `src/tools/memory.py` |

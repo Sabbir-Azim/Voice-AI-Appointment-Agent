@@ -1,18 +1,20 @@
-"""LiveKit voice agent with MongoDB Atlas integration.
+"""Medical clinic receptionist voice agent backed by MongoDB Atlas.
 
-Demonstrates five integration patterns:
+Built on the LiveKit + MongoDB starter's five integration patterns:
 
 1. RAG with $vectorSearch              -> search_knowledge tool
 2. Agentic memory tools                -> remember/recall/forget/search_memories
 3. Identify + pre-load context         -> preload_user (entrypoint)
-4. Function-tool CRUD                  -> @function_tool methods
+4. Function-tool CRUD                  -> appointment tools (tools/appointments.py)
 5. Session report persistence          -> on_session_end
 """
 
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -29,17 +31,25 @@ from livekit.agents import (
     inference,
     room_io,
 )
+from livekit.agents.worker import ServerEnvOption
 from livekit.plugins import ai_coustics
 from pymongo import ReturnDocument
 from pymongo.asynchronous.database import AsyncDatabase
 
 from db.client import aclose, get_db
+from tools import appointments
+from tools.appointments import AppointmentError
 from tools.embeddings import embed_text
 from tools.memory import forget, list_memories, recall, remember, search_memory
 
 load_dotenv(".env.local")
 
 logger = logging.getLogger("agent")
+
+# Clinic settings. Doctor hours in the `doctors` collection are interpreted in
+# CLINIC_TIMEZONE, and every date/time the LLM sees or sends is clinic-local.
+CLINIC_NAME = os.getenv("CLINIC_NAME") or "Sunrise Clinic"
+CLINIC_TZ = ZoneInfo(os.getenv("CLINIC_TIMEZONE") or "America/New_York")
 
 # Fallback identity used only when ctx.job.metadata is absent, e.g. when
 # running `uv run src/agent.py console`. The frontend always provides a
@@ -53,6 +63,8 @@ DEFAULT_TENANT_ID = "default"
 _PROFILE_PATHS = {
     "name": "name",
     "email": "email",
+    "phone": "phone",
+    "date_of_birth": "date_of_birth",
     "preferred_language": "preferences.language",
     "timezone": "preferences.timezone",
 }
@@ -60,6 +72,40 @@ _PROFILE_PATHS = {
 
 def _now() -> datetime:
     return datetime.now(tz=timezone.utc)
+
+
+def receptionist_instructions(now: datetime) -> str:
+    """System prompt for the receptionist, anchored to the current clinic date."""
+    local_now = now.astimezone(CLINIC_TZ)
+    return (
+        f"You are the friendly front-desk receptionist at {CLINIC_NAME}, a "
+        "medical clinic. You are speaking on a voice call, so reply in plain "
+        "text without markdown, lists, or emojis, and keep each reply to one "
+        "or two short sentences. "
+        f"Today is {local_now:%A, %B} {local_now.day}, {local_now.year} and the "
+        f"clinic's local time is {local_now:%H:%M}. Work out relative dates "
+        "like 'next Tuesday' yourself and pass dates to tools as YYYY-MM-DD "
+        "and times as YYYY-MM-DDTHH:MM in clinic time. "
+        "Booking: ask what the visit is for and whether they want a specific "
+        "doctor; if not, call list_doctors and suggest one whose specialty "
+        "fits. Call check_availability and offer two or three of the returned "
+        "times using their spoken form. Never invent a time. Make sure the "
+        "patient's full name is on file, then read back the doctor, day, and "
+        "time and wait for a clear yes before calling book_appointment. "
+        "Rescheduling: call my_appointments, book the new time first, then "
+        "cancel the old one. Cancelling: call my_appointments, confirm which "
+        "appointment, then call cancel_appointment. Never read ids aloud. "
+        "For questions about hours, location, parking, insurance, fees, "
+        "policies, refills, results, or what to bring, call search_knowledge "
+        "and answer only from its results. "
+        "When the patient tells you their name, email, phone number, or date "
+        "of birth, call update_profile. Use remember_detail for lasting facts "
+        "such as allergies, accessibility needs, or a preferred doctor. "
+        "You are not a clinician: never diagnose, give medical advice, or "
+        "interpret symptoms or test results; offer to book a visit instead. "
+        "If the caller describes an emergency such as chest pain, trouble "
+        "breathing, or severe bleeding, tell them to hang up and call 911 now."
+    )
 
 
 async def _vector_search_knowledge(
@@ -91,27 +137,7 @@ class MongoAgent(Agent):
     ) -> None:
         super().__init__(
             chat_ctx=chat_ctx,
-            instructions=(
-                "You are a friendly voice assistant with MongoDB-backed tools. "
-                "The user is speaking to you, so reply in plain text without "
-                "markdown, lists, or emojis. Keep replies short. "
-                "Use lookup_order to retrieve order details by id. "
-                "Use search_knowledge for any question about voice agents, "
-                "MongoDB, LiveKit, STT/LLM/TTS providers, session handling, "
-                "or related topics you are not confident answering from "
-                "prior context. Call it before answering; the tool itself "
-                "keeps the user engaged while it runs. "
-                "When the user tells you their name, email, preferred language, "
-                "or timezone, call update_profile with the matching field so it "
-                "persists in their profile. "
-                "Use remember_detail for any other fact the user volunteers, "
-                "under a short specific label like 'favorite_color', 'allergy', "
-                "or 'preferred_pronouns'. Each label is a slot and writing a "
-                "new value replaces the old one. Use recall_detail only when "
-                "you know the exact label; otherwise call search_memories with "
-                "a natural-language query. Use forget_detail to drop a slot and "
-                "list_user_memories when the user asks what you remember."
-            ),
+            instructions=receptionist_instructions(_now()),
         )
         self._user_id = user_id
         self._tenant_id = tenant_id
@@ -119,47 +145,103 @@ class MongoAgent(Agent):
     async def on_enter(self) -> None:
         await self.session.generate_reply(
             instructions=(
-                "Greet the user by name if the loaded profile or remembered "
-                "facts contain one. If no name is on file, briefly introduce "
-                "yourself as a MongoDB-backed voice assistant and ask the "
-                "user for their name. When they tell you, call update_profile "
-                "with field='name' so it persists for next time."
+                f"Greet the caller as the receptionist at {CLINIC_NAME}. If "
+                "the loaded profile has a name, greet them by name. If no "
+                "name is on file, ask for their full name and call "
+                "update_profile with field='name' when they tell you. Then "
+                "ask how you can help today."
             )
         )
 
     @function_tool()
-    async def lookup_order(self, context: RunContext, order_id: str) -> str:
-        """Look up an order by its ID. Returns items, total, and status."""
+    async def list_doctors(self, context: RunContext) -> str:
+        """List the clinic's doctors with their specialty, days, and hours."""
         db = await get_db()
-        order = await db.orders.find_one({"order_id": order_id})
-        if not order:
-            raise ToolError(f"Order {order_id} not found.")
-        return json.dumps(
-            {
-                "order_id": order["order_id"],
-                "items": order["items"],
-                "total": order["total"],
-                "status": order["status"],
-            }
-        )
+        return json.dumps({"doctors": await appointments.list_doctors(db)})
+
+    @function_tool()
+    async def check_availability(
+        self, context: RunContext, doctor_id: str, date: str
+    ) -> str:
+        """Find open appointment times for a doctor.
+
+        Args:
+            doctor_id: The doctor's id from list_doctors, e.g. 'dr_khan'.
+            date: Preferred day as YYYY-MM-DD in clinic time. If that day is
+                full or the doctor is off, the next day with openings is
+                returned and requested_date_available is false.
+        """
+        db = await get_db()
+        try:
+            result = await appointments.check_availability(
+                db, doctor_id, date, CLINIC_TZ
+            )
+        except AppointmentError as exc:
+            raise ToolError(str(exc)) from exc
+        return json.dumps(result)
+
+    @function_tool()
+    async def book_appointment(
+        self, context: RunContext, doctor_id: str, start: str, reason: str
+    ) -> str:
+        """Book an appointment after the patient has confirmed the details.
+
+        Args:
+            doctor_id: The doctor's id from list_doctors.
+            start: Slot start from check_availability, as YYYY-MM-DDTHH:MM.
+            reason: Short reason for the visit in the patient's words.
+        """
+        context.disallow_interruptions()
+        db = await get_db()
+        try:
+            result = await appointments.book_appointment(
+                db, self._user_id, doctor_id, start, reason, CLINIC_TZ
+            )
+        except AppointmentError as exc:
+            raise ToolError(str(exc)) from exc
+        return json.dumps(result)
+
+    @function_tool()
+    async def my_appointments(self, context: RunContext) -> str:
+        """List the patient's upcoming appointments, soonest first."""
+        db = await get_db()
+        results = await appointments.list_appointments(db, self._user_id, CLINIC_TZ)
+        return json.dumps({"appointments": results})
+
+    @function_tool()
+    async def cancel_appointment(
+        self, context: RunContext, appointment_id: str
+    ) -> str:
+        """Cancel one of the patient's appointments after they confirm.
+
+        Args:
+            appointment_id: The appointment_id from my_appointments.
+        """
+        context.disallow_interruptions()
+        db = await get_db()
+        try:
+            return await appointments.cancel_appointment(
+                db, self._user_id, appointment_id
+            )
+        except AppointmentError as exc:
+            raise ToolError(str(exc)) from exc
 
     @function_tool()
     async def search_knowledge(
         self, context: RunContext, query: str
     ) -> str:
-        """Search the shared knowledge base for facts the user asks about.
+        """Search the clinic's FAQ for facts the caller asks about.
 
-        Use when the user asks a question about voice agents, MongoDB,
-        LiveKit, STT/LLM/TTS providers, session handling, or anything
-        else you are not confident answering from prior context. Returns
-        a JSON object with a `results` array of `{title, content}`.
+        Use for opening hours, address, parking, accepted insurance, fees,
+        cancellation policy, what to bring, refills, and test results.
+        Returns a JSON object with a `results` array of `{title, content}`.
         """
 
         async def _speak_status_update(delay: float = 0.5) -> None:
             await asyncio.sleep(delay)
             await context.session.generate_reply(
                 instructions=(
-                    f"You are searching the knowledge base for '{query}' "
+                    f"You are looking up '{query}' in the clinic's FAQ "
                     "but it is taking a moment. Give the user a brief, "
                     "one-sentence update that you are looking it up."
                 )
@@ -179,7 +261,8 @@ class MongoAgent(Agent):
     ) -> str:
         """Update an identity field on the user's profile.
 
-        Use for name, email, preferred_language, or timezone. These are
+        Use for name, email, phone, date_of_birth, preferred_language, or
+        timezone. These are
         first-class profile fields stored on the `users` document and
         loaded at session start. For anything else, use remember_detail.
         """
@@ -209,9 +292,9 @@ class MongoAgent(Agent):
     ) -> str:
         """Store or replace a fact under memory_type.
 
-        Use for preferences, allergies, pronouns, or anything the user
-        volunteers. Pick a short specific label like 'favorite_color'
-        rather than a generic one like 'preferences'.
+        Use for allergies, accessibility needs, a preferred doctor, or
+        other lasting facts the patient volunteers. Pick a short specific
+        label like 'allergy' or 'preferred_doctor' rather than a generic one.
         """
         db = await get_db()
         return await remember(
@@ -353,7 +436,18 @@ async def on_session_end(ctx: JobContext) -> None:
         await aclose()
 
 
-server = AgentServer()
+# On Windows the first job process cold-imports the inference stack in ~10-15s,
+# longer than the default 10s init timeout and close to the frontend's ~20s wait
+# for the agent to join. Dev mode keeps no warm processes by default, so every
+# call after a (re)start paid that cost. Keep one warm in dev, leave the
+# production default unchanged, and allow a slower first start.
+server = AgentServer(
+    num_idle_processes=ServerEnvOption(
+        dev_default=1,
+        prod_default=AgentServer._default_num_idle_processes.prod_default,
+    ),
+    initialize_process_timeout=30.0,
+)
 
 
 @server.rtc_session(agent_name="my-agent", on_session_end=on_session_end)
